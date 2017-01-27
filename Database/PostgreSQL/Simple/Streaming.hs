@@ -27,14 +27,16 @@ module Database.PostgreSQL.Simple.Streaming
   , streamWithOptionsAndParser_
   ) where
 
+import Control.Exception.Safe
+       (MonadCatch, MonadMask, catch, catchAny, throwM, mask)
+import Control.Monad.Catch (onException)
 import Control.Monad (unless)
-import Control.Monad.Catch
-       (MonadThrow(..), MonadMask(..), catch, mask, onException, mask_)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.Resource
        (MonadResource, register, unprotect)
+import Control.Monad.State (put)
 import Control.Monad.Trans.State.Strict (runStateT)
 import qualified Data.ByteString as B
 import qualified Data.ByteString as B8
@@ -59,9 +61,9 @@ import Database.PostgreSQL.Simple.Transaction
        (isFailedTransactionError, beginMode, commit)
 import Database.PostgreSQL.Simple.TypeInfo (getTypeInfo)
 import Database.PostgreSQL.Simple.Types (Query(..))
-import Streaming (Stream, concats, unfold)
+import Streaming (Stream, unfold, distribute)
 import Streaming.Internal (Stream(..))
-import Streaming.Prelude (Of(..))
+import Streaming.Prelude (Of(..), reread, for, untilRight)
 
 {-|
 
@@ -134,72 +136,56 @@ queryWith parser conn template qs =
 
 -- | A version of 'query_' taking parser as argument.
 queryWith_
-  :: MonadIO m
-  => RowParser r -> Connection -> Query -> Stream (Of r) m ()
+  :: RowParser r -> Connection -> Query -> Stream (Of r) IO ()
 queryWith_ parser conn template@(Query que) = doQuery parser conn template que
 
 doQuery
-  :: MonadIO m
+  :: (MonadIO m, MonadCatch m)
   => RowParser r -> Connection -> Query -> B.ByteString -> Stream (Of r) m ()
-doQuery parser conn q que =
-  concats $ do
-    ok <-
-      liftIO $
-      withConnection conn $ \h ->
-        LibPQ.sendQuery h que <* LibPQ.setSingleRowMode h
-    unless ok $
-      liftIO (withConnection conn LibPQ.errorMessage) >>=
-      traverse_ (liftIO . throwM . flip QueryError q . C8.unpack)
-    flip unfold () $ \() -> do
-      mres <- liftIO (withConnection conn LibPQ.getResult)
-      case mres of
-        Nothing -> return (Left ())
-        Just result -> do
-          status <- liftIO (LibPQ.resultStatus result)
-          case status of
-            LibPQ.EmptyQuery -> do
-              getResultUntilNothing conn
-              liftIO $ throwM $ QueryError "query: Empty query" q
-            LibPQ.CommandOk -> do
-              getResultUntilNothing conn
-              liftIO $ throwM $ QueryError "query resulted in a command response" q
-            LibPQ.CopyOut -> do
-              getResultUntilNothing conn
-              liftIO $ throwM $ QueryError "query: COPY TO is not supported" q
-            LibPQ.CopyIn -> do
-              getResultUntilNothing conn
-              liftIO $ throwM $ QueryError "query: COPY FROM is not supported" q
-            LibPQ.BadResponse -> do
-              getResultUntilNothing conn
-              liftIO (throwResultError "query" result status)
-            LibPQ.NonfatalError -> do
-              getResultUntilNothing conn
-              liftIO (throwResultError "query" result status)
-            LibPQ.FatalError -> do
-              getResultUntilNothing conn
-              liftIO (throwResultError "query" result status)
-            _ -> fmap Right (streamResult conn parser result)
+doQuery parser conn q que = do
+  ok <-
+    liftIO $
+    withConnection conn $ \h ->
+      LibPQ.sendQuery h que <* LibPQ.setSingleRowMode h
+  unless ok $
+    liftIO (withConnection conn LibPQ.errorMessage) >>=
+    traverse_ (liftIO . throwM . flip QueryError q . C8.unpack)
+  (_, fin) <-
+    flip runStateT (return ()) $
+    distribute $
+    for (results conn) $ \result -> do
+      status <- liftIO (LibPQ.resultStatus result)
+      case status of
+        LibPQ.EmptyQuery -> put $ throwM $ QueryError "query: Empty query" q
+        LibPQ.CommandOk ->
+          put $ throwM $ QueryError "query resulted in a command response" q
+        LibPQ.CopyOut ->
+          put $ throwM $ QueryError "query: COPY TO is not supported" q
+        LibPQ.CopyIn ->
+          put $ throwM $ QueryError "query: COPY FROM is not supported" q
+        LibPQ.BadResponse -> put $ throwResultError "query" result status
+        LibPQ.NonfatalError -> put $ throwResultError "query" result status
+        LibPQ.FatalError -> put $ throwResultError "query" result status
+        _ -> catchAny (streamResult conn parser result) (put . throwM)
+  liftIO fin
 
-getResultUntilNothing :: MonadIO m => Connection -> m ()
-getResultUntilNothing c = liftIO (mask_ go)
-  where
-    go = maybe (return ()) (const go) =<< withConnection c LibPQ.getResult
+results :: MonadIO m => Connection -> Stream (Of LibPQ.Result) m ()
+results = reread (liftIO . flip withConnection LibPQ.getResult)
 
 streamResult
   :: MonadIO m
-  => Connection -> RowParser a -> LibPQ.Result -> m (Stream (Of a) m ())
+  => Connection -> RowParser a -> LibPQ.Result -> Stream (Of a) m ()
 streamResult conn parser result = do
   nrows <- liftIO (LibPQ.ntuples result)
   ncols <- liftIO (LibPQ.nfields result)
-  return $
-    unfold
-      (\row ->
-         if row < nrows
-           then do
-             r <- liftIO (getRowWith parser row ncols conn result)
-             return (Right (r :> succ row))
-           else return (Left ()))
-      0
+  unfold
+    (\row ->
+        if row < nrows
+          then do
+            r <- liftIO (getRowWith parser row ncols conn result)
+            return (Right (r :> succ row))
+          else return (Left ()))
+    0
 
 stream
   :: (FromRow row, ToRow params, MonadMask m, MonadResource m)
@@ -276,32 +262,30 @@ doFold FoldOptions{..} parser conn q = do
             unless (isFailedTransactionError ex) $ throwM ex
 
     go =
-      bracket (liftIO declare) (liftIO . close) $ \(Query name) -> do
+      bracket (liftIO declare) (liftIO . close) $ \(Query name) ->
         let fetchQ =
               toByteString
                 (byteString "FETCH FORWARD " <> intDec chunkSize <>
                  byteString " FROM " <>
                  byteString name)
-        concats $
-          unfold
-            (\() -> do
-               result <- liftIO (exec conn fetchQ)
-               status <- liftIO (LibPQ.resultStatus result)
-               case status of
-                 LibPQ.TuplesOk -> do
-                   nrows <- liftIO (LibPQ.ntuples result)
-                   if nrows > 0
-                     then fmap Right (streamResult conn parser result)
-                     else return (Left ())
-                 _ -> liftIO (throwResultError "fold" result status))
-            ()
+            fetches = untilRight $ do
+              result <- liftIO (exec conn fetchQ)
+              status <- liftIO (LibPQ.resultStatus result)
+              case status of
+                LibPQ.TuplesOk -> do
+                  nrows <- liftIO (LibPQ.ntuples result)
+                  if nrows > 0
+                    then return $ Left result
+                    else return $ Right ()
+                _ -> liftIO (throwResultError "fold" result status)
+        in for fetches (streamResult conn parser)
 
--- FIXME: choose the Automatic chunkSize more intelligently
---   One possibility is to use the type of the results,  although this
---   still isn't a perfect solution, given that common types (e.g. text)
---   are of highly variable size.
---   A refinement of this technique is to pick this number adaptively
---   as results are read in from the database.
+    -- FIXME: choose the Automatic chunkSize more intelligently
+    --   One possibility is to use the type of the results,  although this
+    --   still isn't a perfect solution, given that common types (e.g. text)
+    --   are of highly variable size.
+    --   A refinement of this technique is to pick this number adaptively
+    --   as results are read in from the database.
     chunkSize = case fetchQuantity of
                  Automatic   -> 256
                  Fixed n     -> n

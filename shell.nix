@@ -4,14 +4,7 @@ let
 
   inherit (nixpkgs) pkgs;
 
-  f = { mkDerivation, base, postgresql-simple, stdenv, streaming }:
-      mkDerivation {
-        pname = "streaming-postgresql-simple";
-        version = "0.1.0.0";
-        src = ./.;
-        libraryHaskellDepends = [ base postgresql-simple streaming ];
-        license = stdenv.lib.licenses.bsd3;
-      };
+  f = ./.;
 
   haskellPackages = if compiler == "default"
                        then pkgs.haskellPackages
