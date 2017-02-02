@@ -10,6 +10,10 @@ category:            Database
 build-type:          Simple
 extra-source-files:  ChangeLog.md
 cabal-version:       >=1.10
+bug-reports:         https://github.com/ocharles/streaming-postgresql-simple/issues
+source-repository head
+                    type: git
+                    location: https://github.com/ocharles/streaming-postgresql-simple
 
 library
   exposed-modules:     Database.PostgreSQL.Simple.Streaming
