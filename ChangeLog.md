@@ -28,6 +28,6 @@ cleanup actions (commit/rolling back the transaction) now only happen if there
 is still a transaction open. 
 
 
-## 0.1.0.0  -- YYYY-mm-dd
+## 0.1.0.0  -- 2017-02-02
 
-* First version. Released on an unsuspecting world.
+* First version. Released on an unsuspecting world. Mwahaha.
