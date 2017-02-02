@@ -11,19 +11,16 @@ module Database.PostgreSQL.Simple.Streaming
   , queryWith
   , queryWith_
 
-    -- * Streaming queries with cursors
+    -- * Queries that stream results
   , stream
-  , stream_
-
-    -- ** Streaming with options
-  , FoldOptions(..)
-  , FetchQuantity(..)
-  , defaultFoldOptions
   , streamWithOptions
+  , stream_
   , streamWithOptions_
 
-    -- ** Streaming with options and a @RowParser@
+    -- ** Queries that stream results taking a parser as an argument
+  , streamWith
   , streamWithOptionsAndParser
+  , streamWith_
   , streamWithOptionsAndParser_
   ) where
 
@@ -68,25 +65,26 @@ import Streaming.Prelude (Of(..), reread, for, untilRight)
 {-|
 
 Perform a @SELECT@ or other SQL query that is expected to return results. Uses
-PostgreSQL's <single row https://www.postgresql.org/docs/current/static/libpq-single-row-mode.html> to
+PostgreSQL's <https://www.postgresql.org/docs/current/static/libpq-single-row-mode.html single row mode> to
 stream results directly from the socket to Haskell.
 
 It is an error to perform another query using the same connection from within
 a stream. This applies to both @streaming-postgresql-simple@ and
 @postgresql-simple@ itself. If you do need to perform subsequent queries from
-within a stream, you should use 'fold'.
+within a stream, you should use 'stream', which uses cursors and allows
+interleaving of queries.
 
-For example:
+To demonstrate the problems of interleaving queries, if we run the following:
 
 @
-let stream c =
+let doQuery c =
       queryWith_ (Pg.fromRow :: RowParser (Pg.Only Int))
                  c
                  "VALUES (1), (2)"
-in S.print (S.mapM_ (\_ -> stream c) (stream c))
+in S.print (S.mapM_ (\_ -> doQuery c) (doQuery c))
 @
 
-Will raise the exception:
+We will encounter the exception:
 
 @
 Exception: QueryError {qeMessage = "another command is already in progress\n", qeQuery = "VALUES (1), (2)"}
@@ -94,14 +92,14 @@ Exception: QueryError {qeMessage = "another command is already in progress\n", q
 
 Exceptions that may be thrown:
 
-* 'FormatError': the query string could not be formatted correctly.
+* 'Database.PostgreSQL.Simple.FormatError': the query string could not be formatted correctly.
 
 * 'QueryError': the result contains no columns (i.e. you should be
   using 'execute' instead of 'query').
 
 * 'ResultError': result conversion failed.
 
-* 'SqlError':  the postgresql backend returned an error,  e.g.
+* 'Database.PostgreSQL.Simple.SqlError':  the postgresql backend returned an error,  e.g.
   a syntax or type error,  or an incorrect table or column name.
 
 -}
@@ -187,16 +185,51 @@ streamResult conn parser result = do
           else return (Left ()))
     0
 
+-- | Perform a @SELECT@ or other SQL query that is expected to return
+-- results. Results are streamed incrementally from the server.
+--
+-- When dealing with small results that don't require further access
+-- to the database it may be simpler (and perhaps faster) to use 'query'
+-- instead.
+--
+-- This is implemented using a database cursor.    As such,  this requires
+-- a transaction.   This function will detect whether or not there is a
+-- transaction in progress,  and will create a 'ReadCommitted' 'ReadOnly'
+-- transaction if needed.   The cursor is given a unique temporary name,
+-- so the consumer may itself call 'stream'.
+--
+-- Exceptions that may be thrown:
+--
+-- * 'Database.PostgreSQL.Simple.FormatError': the query string could not be formatted correctly.
+--
+-- * 'QueryError': the result contains no columns (i.e. you should be
+--   using 'execute' instead of 'query').
+--
+-- * 'ResultError': result conversion failed.
+--
+-- * 'Database.PostgreSQL.Simple.SqlError':  the postgresql backend returned an error,  e.g.
+--   a syntax or type error,  or an incorrect table or column name.
+
 stream
   :: (FromRow row, ToRow params, MonadMask m, MonadResource m)
   => Connection -> Query -> params -> Stream (Of row) m ()
-stream = streamWithOptions defaultFoldOptions
+stream = streamWith fromRow
 
-streamWithOptions
-  :: (FromRow row, ToRow params, MonadMask m, MonadResource m)
-  => FoldOptions -> Connection -> Query -> params -> Stream (Of row) m ()
-streamWithOptions o = streamWithOptionsAndParser o fromRow
+streamWithOptions :: (FromRow row,ToRow params,MonadResource m,MonadMask m)
+                  => FoldOptions
+                  -> Connection
+                  -> Query
+                  -> params
+                  -> Stream (Of row) m ()
+streamWithOptions options = streamWithOptionsAndParser options fromRow
 
+-- | A version of 'stream' taking a parser as an argument.
+streamWith
+  :: (ToRow params, MonadMask m, MonadResource m)
+  => RowParser row -> Connection -> Query -> params -> Stream (Of row) m ()
+streamWith = streamWithOptionsAndParser defaultFoldOptions
+
+-- | A version of 'streamWithOptions' taking a parser as an argument.
 streamWithOptionsAndParser
   :: (ToRow params, MonadMask m, MonadResource m)
   => FoldOptions
@@ -209,25 +242,40 @@ streamWithOptionsAndParser options parser conn template qs = do
   q <- liftIO (formatQuery conn template qs)
   doFold options parser conn (Query q)
 
+
+-- | A version of 'stream' that does not perform query substitution.
 stream_
   :: (FromRow row, MonadMask m, MonadResource m)
   => Connection -> Query -> Stream (Of row) m ()
-stream_ = streamWithOptions_ defaultFoldOptions
+stream_ = streamWith_ fromRow
 
-streamWithOptions_
-  :: (FromRow row, MonadMask m, MonadResource m)
-  => FoldOptions -> Connection -> Query -> Stream (Of row) m ()
-streamWithOptions_ options conn template = doFold options fromRow conn template
+streamWithOptions_ :: (FromRow row,MonadResource m,MonadMask m)
+                   => FoldOptions
+                   -> Connection
+                   -> Query
+                   -> Stream (Of row) m ()
+streamWithOptions_ options = streamWithOptionsAndParser_ options fromRow
 
+-- | A version of 'stream_' taking a parser as an argument.
+streamWith_
+  :: (MonadMask m, MonadResource m)
+  => RowParser row -> Connection -> Query -> Stream (Of row) m ()
+streamWith_ parser conn template = doFold defaultFoldOptions parser conn template
+
+-- | A version of 'streamWithOptions_' taking a parser as an argument.
 streamWithOptionsAndParser_
   :: (MonadMask m, MonadResource m)
   => FoldOptions -> RowParser row -> Connection -> Query -> Stream (Of row) m ()
 streamWithOptionsAndParser_ options parser conn template =
   doFold options parser conn template
 
-doFold
-  :: (MonadIO m, MonadMask m, MonadResource m)
-  => FoldOptions -> RowParser row -> Connection -> Query -> Stream (Of row) m ()
+doFold :: forall row m.
+          (MonadIO m,MonadMask m,MonadResource m)
+       => FoldOptions
+       -> RowParser row
+       -> Connection
+       -> Query
+       -> Stream (Of row) m ()
 doFold FoldOptions{..} parser conn q = do
     stat <- liftIO (withConnection conn LibPQ.transactionStatus)
     case stat of
@@ -255,12 +303,12 @@ doFold FoldOptions{..} parser conn q = do
                  [ "DECLARE ", name, " NO SCROLL CURSOR FOR ", q ]
         return name
     close name = do
-        Prelude.putStrLn "Closing"
         (execute_ conn ("CLOSE " <> name) >> return ()) `catch` \ex ->
             -- Don't throw exception if CLOSE failed because the transaction is
             -- aborted.  Otherwise, it will throw away the original error.
             unless (isFailedTransactionError ex) $ throwM ex
 
+    go :: Stream (Of row) m ()
     go =
       bracket (liftIO declare) (liftIO . close) $ \(Query name) ->
         let fetchQ =
@@ -350,16 +398,16 @@ toByteString x = LBS.toStrict (toLazyByteString x)
 data Restore m = Unmasked | Masked (forall x . m x -> m x)
 
 liftMask
-    :: forall m f r . (MonadIO m, Functor f)
+    :: forall a m r . (MonadIO m)
     => (forall s . ((forall x . m x -> m x) -> m s) -> m s)
-    -> ((forall x . Stream f m x -> Stream f m x)
-        -> Stream f m r)
-    -> Stream f m r
+    -> ((forall x . Stream (Of a) m x -> Stream (Of a) m x)
+        -> Stream (Of a) m r)
+    -> Stream (Of a) m r
 liftMask maskVariant k = do
     ioref <- liftIO $ newIORef Unmasked
 
     let -- mask adjacent actions in base monad
-        loop :: Stream f m r -> Stream f m r
+        loop :: Stream (Of a) m r -> Stream (Of a) m r
         loop (Step f)   = Step (fmap loop f)
         loop (Return r) = Return r
         loop (Effect m) = Effect $ maskVariant $ \unmaskVariant -> do
@@ -368,7 +416,7 @@ liftMask maskVariant k = do
             m >>= chunk >>= return . loop
 
         -- unmask adjacent actions in base monad
-        unmask :: forall q. Stream f m q -> Stream f m q
+        unmask :: forall q. Stream (Of a) m q -> Stream (Of a) m q
         unmask (Step f)   = Step (fmap unmask f)
         unmask (Return q) = Return q
         unmask (Effect m) = Effect $ do
@@ -377,15 +425,15 @@ liftMask maskVariant k = do
             unmaskVariant (m >>= chunk >>= return . unmask)
 
         -- merge adjacent actions in base monad
-        chunk :: forall s. Stream f m s -> m (Stream f m s)
+        chunk :: forall s. Stream (Of a) m s -> m (Stream (Of a) m s)
         chunk (Effect m) = m >>= chunk
         chunk s          = return s
 
     loop $ k unmask
 
 bracket
-  :: (Functor f, MonadIO m, MonadMask m, MonadResource m)
-  => m a -> (a -> IO ()) -> (a -> Stream f m c) -> Stream f m c
+  :: (MonadIO m, MonadMask m, MonadResource m)
+  => m a -> (a -> IO ()) -> (a -> Stream (Of b) m c) -> Stream (Of b) m c
 bracket before after action = liftMask mask $ \restore -> do
     h <- lift before
     r <- restore (action h) `onTermination` after h
