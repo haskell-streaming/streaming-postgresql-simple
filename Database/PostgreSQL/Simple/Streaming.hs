@@ -22,18 +22,22 @@ module Database.PostgreSQL.Simple.Streaming
   , streamWithOptionsAndParser
   , streamWith_
   , streamWithOptionsAndParser_
+
+    -- * Streaming data in and out of PostgreSQL with @COPY@
+  , copyIn
+  , copyOut
   ) where
 
 import Control.Exception.Safe
        (MonadCatch, MonadMask, catch, catchAny, throwM, mask)
-import Control.Monad.Catch (onException)
 import Control.Monad (unless)
+import Control.Monad.Catch (onException)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.State (put)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.Resource
        (MonadResource, register, unprotect)
-import Control.Monad.State (put)
 import Control.Monad.Trans.State.Strict (runStateT)
 import qualified Data.ByteString as B
 import qualified Data.ByteString as B8
@@ -42,12 +46,14 @@ import qualified Data.ByteString.Char8 as C8
 import qualified Data.ByteString.Lazy as LBS
 import Data.Foldable (traverse_)
 import Data.IORef
+import Data.Int (Int64)
 import Data.Monoid ((<>))
 import qualified Database.PostgreSQL.LibPQ as LibPQ
 import Database.PostgreSQL.Simple
        (Connection, QueryError(..), ResultError(..), ToRow, FromRow,
         formatQuery, FoldOptions(..), FetchQuantity(..), execute_,
         defaultFoldOptions, rollback)
+import qualified Database.PostgreSQL.Simple.Copy as Pg
 import Database.PostgreSQL.Simple.FromRow (fromRow)
 import Database.PostgreSQL.Simple.Internal
        (RowParser(..), runConversion, throwResultError, withConnection,
@@ -61,6 +67,7 @@ import Database.PostgreSQL.Simple.Types (Query(..))
 import Streaming (Stream, unfold, distribute)
 import Streaming.Internal (Stream(..))
 import Streaming.Prelude (Of(..), reread, for, untilRight)
+import qualified Streaming.Prelude as S
 
 {-|
 
@@ -452,3 +459,46 @@ m1 `onTermination` io = do
             Return r -> Effect (unprotect key >> return (Return r))
             Effect m -> Effect (fmap loop m)
             Step f -> Step (fmap loop f)
+
+-- | Issue a @COPY FROM STDIN@ query and stream the results in.
+--
+-- Note that the data in the stream not need to represent a single row, or
+-- even an integral number of rows.
+--
+-- The stream indicates whether or not the copy was succesful. If the stream
+-- terminates with 'Nothing', the copy is succesful. If the stream terminates
+-- with 'Just' @error@, the error message will be logged.
+--
+-- If copying was successful, the number of rows processed is returned.
+copyIn
+  :: (ToRow params, MonadIO m)
+  => Connection
+  -> Query
+  -> params
+  -> Stream (Of B.ByteString) m (Maybe B.ByteString)
+  -> m (Maybe Int64)
+copyIn conn q params copyData =
+  do liftIO (Pg.copy conn q params)
+     res <- S.mapM_ (liftIO . Pg.putCopyData conn) copyData
+     case res of
+       Just e -> liftIO $ do
+         Pg.putCopyError conn e
+         return Nothing
+
+       Nothing -> liftIO $
+         fmap Just (Pg.putCopyEnd conn)
+
+-- | Issue a @COPY TO STDOUT@ query and stream the results. When the stream is
+-- drained it returns the total amount of rows returned. Each element in the
+-- stream is either exactly one row of the result, or header or footer
+-- data depending on format.
+copyOut
+  :: (MonadIO m, ToRow params)
+  => Connection -> Query -> params -> Stream (Of B.ByteString) m Int64
+copyOut conn q params = do
+  liftIO (Pg.copy conn q params)
+  untilRight $ do
+    res <- liftIO (Pg.getCopyData conn)
+    case res of
+      Pg.CopyOutRow bytes -> return (Left bytes)
+      Pg.CopyOutDone n -> return (Right n)
