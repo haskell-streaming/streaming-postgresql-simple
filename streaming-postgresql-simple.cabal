@@ -1,5 +1,5 @@
 name:                streaming-postgresql-simple
-version:             0.1.0.0
+version:             0.2.0.0
 synopsis:            Stream postgresql-query results using the streaming library
 description:         This package provides incremental streaming functions for the @postgresql-simple@ library.
 license:             BSD3
