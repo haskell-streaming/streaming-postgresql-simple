@@ -29,6 +29,9 @@ module Database.PostgreSQL.Simple.Streaming
     -- * Streaming data in and out of PostgreSQL with @COPY@
   , copyIn
   , copyOut
+
+    -- * Re-exported symbols
+  , runResourceT
   ) where
 
 import Control.Exception.Safe
@@ -39,7 +42,7 @@ import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.Resource
-       (MonadResource, register, unprotect)
+       (MonadResource, register, unprotect, runResourceT)
 import Control.Monad.Trans.State.Strict (runStateT)
 import qualified Data.ByteString as B
 import qualified Data.ByteString as B8
@@ -162,6 +165,7 @@ doQuery parser conn q que = do
 
   where
 
+    drainRemainingResults :: MonadIO m => m ()
     drainRemainingResults =
       S.effects (results conn)
 
@@ -223,6 +227,16 @@ streamResult conn parser result = do
 -- transaction in progress,  and will create a 'ReadCommitted' 'ReadOnly'
 -- transaction if needed.   The cursor is given a unique temporary name,
 -- so the consumer may itself call 'stream'.
+--
+-- Due to the dependency on transactions, you must ensure that `commit`
+-- or `rollback` aren't called on the connection used to form a stream.
+-- Doing so causes the stream cursor to be released, making it impossible
+-- to stream more results. If you do perform a commit or rollback,
+-- 'stream' will raise an exception indicating that a transaction
+-- was aborted.
+--
+-- If you performing transaction writes in a stream, consider instead
+-- using save points, which will nest correctly with 'stream'.
 --
 -- Exceptions that may be thrown:
 --
@@ -307,8 +321,8 @@ doFold FoldOptions{..} parser conn q = do
     case stat of
       LibPQ.TransIdle    ->
         bracket (liftIO (beginMode transactionMode conn))
-                (\_ -> liftIO (commit conn))
-                (\_ -> go `onException` liftIO (rollback conn))
+                (\_ -> ifInTransaction $ liftIO (commit conn))
+                (\_ -> go `onException` ifInTransaction (liftIO (rollback conn)))
       LibPQ.TransInTrans -> go
       LibPQ.TransActive  -> fail "foldWithOpts FIXME:  PQ.TransActive"
          -- This _shouldn't_ occur in the current incarnation of
@@ -323,12 +337,20 @@ doFold FoldOptions{..} parser conn q = do
       LibPQ.TransUnknown -> fail "foldWithOpts FIXME:  PQ.TransUnknown"
          -- Not sure what this means.
   where
+    ifInTransaction m = do
+      stat <- liftIO (withConnection conn LibPQ.transactionStatus)
+      case stat of
+        LibPQ.TransInTrans -> m
+        _ -> return ()
+
     declare = do
         name <- newTempName conn
         _ <- execute_ conn $ mconcat
                  [ "DECLARE ", name, " NO SCROLL CURSOR FOR ", q ]
         return name
-    close name = do
+
+    close name =
+      ifInTransaction $
         (execute_ conn ("CLOSE " <> name) >> return ()) `catch` \ex ->
             -- Don't throw exception if CLOSE failed because the transaction is
             -- aborted.  Otherwise, it will throw away the original error.
@@ -343,6 +365,12 @@ doFold FoldOptions{..} parser conn q = do
                  byteString " FROM " <>
                  byteString name)
             fetches = untilRight $ do
+
+              stat <- liftIO (withConnection conn LibPQ.transactionStatus)
+              case stat of
+                LibPQ.TransInTrans -> return ()
+                _ -> fail "Stream transaction prematurely aborted"
+
               result <- liftIO (exec conn fetchQ)
               status <- liftIO (LibPQ.resultStatus result)
               case status of
