@@ -32,11 +32,10 @@ module Database.PostgreSQL.Simple.Streaming
   ) where
 
 import Control.Exception.Safe
-       (MonadCatch, MonadMask, catch, catchAny, throwM, mask)
+       (MonadMask, catch, throwM, mask)
 import Control.Monad (unless)
 import Control.Monad.Catch (onException)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.State (put)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.Resource
@@ -67,7 +66,7 @@ import Database.PostgreSQL.Simple.Transaction
        (isFailedTransactionError, beginMode, commit)
 import Database.PostgreSQL.Simple.TypeInfo (getTypeInfo)
 import Database.PostgreSQL.Simple.Types (Query(..))
-import Streaming (Stream, unfold, distribute)
+import Streaming (Stream, unfold)
 import Streaming.Internal (Stream(..))
 import Streaming.Prelude (Of(..), reread, for, untilRight)
 import qualified Streaming.Prelude as S
@@ -115,40 +114,41 @@ Exceptions that may be thrown:
 -}
 
 query
-  :: (ToRow q, FromRow r)
+  :: (ToRow q, FromRow r, MonadResource m)
   => Connection
   -> Query
   -> q
-  -> Stream (Of r) IO ()
+  -> Stream (Of r) m ()
 query conn template qs =
   doQuery fromRow conn template =<< liftIO (formatQuery conn template qs)
 
 -- | A version of 'query' that does not perform query substitution.
 query_
-  :: (FromRow r)
+  :: (FromRow r, MonadResource m)
   => Connection
   -> Query
-  -> Stream (Of r) IO ()
+  -> Stream (Of r) m ()
 query_ conn template@(Query que) = doQuery fromRow conn template que
 
 -- | A version of 'query' taking parser as argument.
 queryWith
-  :: (ToRow q)
+  :: (ToRow q, MonadResource m)
   => RowParser r
   -> Connection
   -> Query
   -> q
-  -> Stream (Of r) IO ()
+  -> Stream (Of r) m ()
 queryWith parser conn template qs =
   doQuery parser conn template =<< liftIO (formatQuery conn template qs)
 
 -- | A version of 'query_' taking parser as argument.
 queryWith_
-  :: RowParser r -> Connection -> Query -> Stream (Of r) IO ()
+  :: MonadResource m
+  => RowParser r -> Connection -> Query -> Stream (Of r) m ()
 queryWith_ parser conn template@(Query que) = doQuery parser conn template que
 
 doQuery
-  :: (MonadIO m, MonadCatch m)
+  :: (MonadResource m)
   => RowParser r -> Connection -> Query -> B.ByteString -> Stream (Of r) m ()
 doQuery parser conn q que = do
   ok <-
@@ -158,24 +158,40 @@ doQuery parser conn q que = do
   unless ok $
     liftIO (withConnection conn LibPQ.errorMessage) >>=
     traverse_ (liftIO . throwM . flip QueryError q . C8.unpack)
-  (_, fin) <-
-    flip runStateT (return ()) $
-    distribute $
-    for (results conn) $ \result -> do
-      status <- liftIO (LibPQ.resultStatus result)
-      case status of
-        LibPQ.EmptyQuery -> put $ throwM $ QueryError "query: Empty query" q
-        LibPQ.CommandOk ->
-          put $ throwM $ QueryError "query resulted in a command response" q
-        LibPQ.CopyOut ->
-          put $ throwM $ QueryError "query: COPY TO is not supported" q
-        LibPQ.CopyIn ->
-          put $ throwM $ QueryError "query: COPY FROM is not supported" q
-        LibPQ.BadResponse -> put $ throwResultError "query" result status
-        LibPQ.NonfatalError -> put $ throwResultError "query" result status
-        LibPQ.FatalError -> put $ throwResultError "query" result status
-        _ -> catchAny (streamResult conn parser result) (put . throwM)
-  liftIO fin
+  yieldResults `onTermination` drainRemainingResults
+
+  where
+
+    drainRemainingResults =
+      S.effects (results conn)
+
+    yieldResults =
+      for (results conn) $ \result -> do
+        status <- liftIO (LibPQ.resultStatus result)
+        case status of
+          LibPQ.EmptyQuery ->
+            liftIO $ throwM $ QueryError "query: Empty query" q
+
+          LibPQ.CommandOk ->
+            liftIO $ throwM $ QueryError "query resulted in a command response" q
+
+          LibPQ.CopyOut ->
+            liftIO $ throwM $ QueryError "query: COPY TO is not supported" q
+
+          LibPQ.CopyIn ->
+            liftIO $ throwM $ QueryError "query: COPY FROM is not supported" q
+
+          LibPQ.BadResponse ->
+            liftIO (throwResultError "query" result status)
+
+          LibPQ.NonfatalError ->
+            liftIO (throwResultError "query" result status)
+
+          LibPQ.FatalError ->
+            liftIO (throwResultError "query" result status)
+
+          _ ->
+            streamResult conn parser result
 
 results :: MonadIO m => Connection -> Stream (Of LibPQ.Result) m ()
 results = reread (liftIO . flip withConnection LibPQ.getResult)
