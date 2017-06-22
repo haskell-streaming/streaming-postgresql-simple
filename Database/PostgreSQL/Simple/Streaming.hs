@@ -6,8 +6,11 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Database.PostgreSQL.Simple.Streaming
-  ( -- * Queries that return results
-    query
+  ( -- * Obtaining a connection
+    withPGConnection
+
+    -- * Queries that return results
+  , query
   , query_
 
     -- ** Queries taking parser as argument
@@ -37,7 +40,7 @@ module Database.PostgreSQL.Simple.Streaming
 import Control.Exception.Safe
        (MonadMask, catch, throwM, mask)
 import Control.Monad (unless)
-import Control.Monad.Catch (onException)
+import Control.Monad.Catch (bracket, onException)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
@@ -57,7 +60,7 @@ import qualified Database.PostgreSQL.LibPQ as LibPQ
 import Database.PostgreSQL.Simple
        (Connection, QueryError(..), ResultError(..), ToRow, FromRow,
         formatQuery, FoldOptions(..), FetchQuantity(..), execute_,
-        defaultFoldOptions, rollback)
+        defaultFoldOptions, rollback, connectPostgreSQL, close)
 import qualified Database.PostgreSQL.Simple.Copy as Pg
 import Database.PostgreSQL.Simple.FromRow (fromRow)
 import Database.PostgreSQL.Simple.Internal
@@ -73,6 +76,13 @@ import Streaming (Stream, unfold)
 import Streaming.Internal (Stream(..))
 import Streaming.Prelude (Of(..), reread, for, untilRight)
 import qualified Streaming.Prelude as S
+
+-- | A bracketed method of obtaining a PostgreSQL connection which
+-- will close on an exception.
+withPGConnection :: (MonadMask m, MonadIO m) => B.ByteString
+                    -> (Connection -> m r) -> m r
+withPGConnection connStr = bracket (liftIO (connectPostgreSQL connStr))
+                                   (liftIO . close)
 
 {-|
 
@@ -349,7 +359,7 @@ doFold FoldOptions{..} parser conn q = do
                  [ "DECLARE ", name, " NO SCROLL CURSOR FOR ", q ]
         return name
 
-    close name =
+    closeConn name =
       ifInTransaction $
         (execute_ conn ("CLOSE " <> name) >> return ()) `catch` \ex ->
             -- Don't throw exception if CLOSE failed because the transaction is
@@ -358,7 +368,7 @@ doFold FoldOptions{..} parser conn q = do
 
     go :: Stream (Of row) m ()
     go =
-      bracketStream (liftIO declare) (liftIO . close) $ \(Query name) ->
+      bracketStream (liftIO declare) (liftIO . closeConn) $ \(Query name) ->
         let fetchQ =
               toByteString
                 (byteString "FETCH FORWARD " <> intDec chunkSize <>
