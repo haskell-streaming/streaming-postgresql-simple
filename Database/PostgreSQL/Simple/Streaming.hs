@@ -11,11 +11,15 @@ module Database.PostgreSQL.Simple.Streaming
 
     -- * Queries that return results
   , query
+  , withQuery
   , query_
+  , withQuery_
 
     -- ** Queries taking parser as argument
   , queryWith
+  , withQueryWith
   , queryWith_
+  , withQueryWith_
 
     -- * Queries that stream results
   , stream
@@ -40,7 +44,7 @@ module Database.PostgreSQL.Simple.Streaming
 import Control.Exception.Safe
        (MonadMask, catch, throwM, mask)
 import Control.Monad (unless)
-import Control.Monad.Catch (bracket, onException)
+import Control.Monad.Catch (bracket, onException, finally)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
@@ -135,6 +139,16 @@ query
 query conn template qs =
   doQuery fromRow conn template =<< liftIO (formatQuery conn template qs)
 
+-- | A variant of 'query' that takes a continuation.
+withQuery
+  :: (ToRow q, FromRow a, MonadIO m, MonadMask m)
+  => Connection
+  -> Query
+  -> q
+  -> (Stream (Of a) m () -> m r)
+  -> m r
+withQuery = withQueryWith fromRow
+
 -- | A version of 'query' that does not perform query substitution.
 query_
   :: (FromRow r, MonadResource m)
@@ -142,6 +156,15 @@ query_
   -> Query
   -> Stream (Of r) m ()
 query_ conn template@(Query que) = doQuery fromRow conn template que
+
+-- | A version of 'withQuery' that does not perform query substitution.
+withQuery_
+  :: (FromRow a, MonadIO m, MonadMask m)
+  => Connection
+  -> Query
+  -> (Stream (Of a) m () -> m r)
+  -> m r
+withQuery_ = withQueryWith_ fromRow
 
 -- | A version of 'query' taking parser as argument.
 queryWith
@@ -154,11 +177,34 @@ queryWith
 queryWith parser conn template qs =
   doQuery parser conn template =<< liftIO (formatQuery conn template qs)
 
+-- | A version of 'withQuery' taking the row parser as an argument.
+withQueryWith
+  :: (ToRow q, MonadIO m, MonadMask m)
+  => RowParser a
+  -> Connection
+  -> Query
+  -> q
+  -> (Stream (Of a) m () -> m r)
+  -> m r
+withQueryWith parser conn template qs f =
+  liftIO (formatQuery conn template qs)
+  >>= \que -> doWithQuery parser conn template que f
+
 -- | A version of 'query_' taking parser as argument.
 queryWith_
   :: MonadResource m
   => RowParser r -> Connection -> Query -> Stream (Of r) m ()
 queryWith_ parser conn template@(Query que) = doQuery parser conn template que
+
+-- | A version of 'withQuery_' taking the row parser as an argument.
+withQueryWith_
+  :: (MonadIO m, MonadMask m)
+  => RowParser a
+  -> Connection
+  -> Query
+  -> (Stream (Of a) m () -> m r)
+  -> m r
+withQueryWith_ parser conn template@(Query que) = doWithQuery parser conn template que
 
 doQuery
   :: (MonadResource m)
@@ -178,6 +224,50 @@ doQuery parser conn q que = do
     drainRemainingResults :: MonadIO m => m ()
     drainRemainingResults =
       S.effects (results conn)
+
+    yieldResults =
+      for (results conn) $ \result -> do
+        status <- liftIO (LibPQ.resultStatus result)
+        case status of
+          LibPQ.EmptyQuery ->
+            liftIO $ throwM $ QueryError "query: Empty query" q
+
+          LibPQ.CommandOk ->
+            liftIO $ throwM $ QueryError "query resulted in a command response" q
+
+          LibPQ.CopyOut ->
+            liftIO $ throwM $ QueryError "query: COPY TO is not supported" q
+
+          LibPQ.CopyIn ->
+            liftIO $ throwM $ QueryError "query: COPY FROM is not supported" q
+
+          LibPQ.BadResponse ->
+            liftIO (throwResultError "query" result status)
+
+          LibPQ.NonfatalError ->
+            liftIO (throwResultError "query" result status)
+
+          LibPQ.FatalError ->
+            liftIO (throwResultError "query" result status)
+
+          _ ->
+            streamResult conn parser result
+
+-- @do@ prefix because we don't want to call this 'withQuery'
+doWithQuery :: (MonadMask m, MonadIO m)
+            => RowParser a -> Connection -> Query -> B.ByteString
+            -> (Stream (Of a) m () -> m r) -> m r
+doWithQuery parser conn q que f = do
+  ok <-
+    liftIO $
+    withConnection conn $ \h ->
+      LibPQ.sendQuery h que <* LibPQ.setSingleRowMode h
+  if not ok
+     then liftIO (withConnection conn LibPQ.errorMessage)
+          >>= throwM . flip QueryError q . maybe "Unspecified error" C8.unpack
+     else f yieldResults `finally` drainRemainingResults
+  where
+    drainRemainingResults = S.effects (results conn)
 
     yieldResults =
       for (results conn) $ \result -> do
