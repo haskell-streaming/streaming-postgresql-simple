@@ -320,9 +320,9 @@ doFold FoldOptions{..} parser conn q = do
     stat <- liftIO (withConnection conn LibPQ.transactionStatus)
     case stat of
       LibPQ.TransIdle    ->
-        bracket (liftIO (beginMode transactionMode conn))
-                (\_ -> ifInTransaction $ liftIO (commit conn))
-                (\_ -> go `onException` ifInTransaction (liftIO (rollback conn)))
+        bracketStream (liftIO (beginMode transactionMode conn))
+                      (\_ -> ifInTransaction $ liftIO (commit conn))
+                      (\_ -> go `onException` ifInTransaction (liftIO (rollback conn)))
       LibPQ.TransInTrans -> go
       LibPQ.TransActive  -> fail "foldWithOpts FIXME:  PQ.TransActive"
          -- This _shouldn't_ occur in the current incarnation of
@@ -358,7 +358,7 @@ doFold FoldOptions{..} parser conn q = do
 
     go :: Stream (Of row) m ()
     go =
-      bracket (liftIO declare) (liftIO . close) $ \(Query name) ->
+      bracketStream (liftIO declare) (liftIO . close) $ \(Query name) ->
         let fetchQ =
               toByteString
                 (byteString "FETCH FORWARD " <> intDec chunkSize <>
@@ -485,10 +485,10 @@ liftMask maskVariant k = do
 
     loop $ k unmask
 
-bracket
+bracketStream
   :: (MonadIO m, MonadMask m, MonadResource m)
   => m a -> (a -> IO ()) -> (a -> Stream (Of b) m c) -> Stream (Of b) m c
-bracket before after action = liftMask mask $ \restore -> do
+bracketStream before after action = liftMask mask $ \restore -> do
     h <- lift before
     r <- restore (action h) `onTermination` after h
     liftIO (after h)
