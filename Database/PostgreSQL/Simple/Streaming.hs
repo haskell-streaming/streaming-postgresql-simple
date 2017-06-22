@@ -44,6 +44,7 @@ module Database.PostgreSQL.Simple.Streaming
     -- * Streaming data in and out of PostgreSQL with @COPY@
   , copyIn
   , copyOut
+  , withCopyOut
 
     -- * Re-exported symbols
   , runResourceT
@@ -808,3 +809,12 @@ copyOut conn q params = do
     case res of
       Pg.CopyOutRow bytes -> return (Left bytes)
       Pg.CopyOutDone n -> return (Right n)
+
+-- | A variant of 'copyOut' that takes a continuation to handle the output.
+--
+-- No extra safety is gained with this function, but it can help
+-- chaining together with all the other @with*@ functions.
+withCopyOut :: (MonadIO m, ToRow params)
+            => Connection -> Query -> params
+            -> (Stream (Of B.ByteString) m Int64 -> m r) -> m r
+withCopyOut conn q params f = f (copyOut conn q params)
