@@ -62,6 +62,18 @@ module Database.PostgreSQL.Simple.Streaming
 
     -- * Re-exported symbols
   , runResourceT
+    -- * Obtaining a connection
+  , connectPostgreSQL
+  , connect
+  , ConnectInfo(..)
+  , defaultConnectInfo
+  , postgreSQLConnectionString
+  , close
+    -- ** Possible exceptions
+  , QueryError(..)
+  , ResultError(..)
+  , ManyErrors(..)
+  , SqlError(..)
   ) where
 
 import Control.Exception.Safe
@@ -87,7 +99,9 @@ import qualified Database.PostgreSQL.LibPQ as LibPQ
 import Database.PostgreSQL.Simple
        (Connection, QueryError(..), ResultError(..), ToRow, FromRow,
         formatQuery, FoldOptions(..), FetchQuantity(..), execute_,
-        defaultFoldOptions, rollback, connectPostgreSQL, close)
+        defaultFoldOptions, rollback, connect, connectPostgreSQL,
+        ConnectInfo(..), defaultConnectInfo, postgreSQLConnectionString,
+        close, SqlError(..))
 import qualified Database.PostgreSQL.Simple.Copy as Pg
 import Database.PostgreSQL.Simple.FromRow (fromRow)
 import Database.PostgreSQL.Simple.Internal
