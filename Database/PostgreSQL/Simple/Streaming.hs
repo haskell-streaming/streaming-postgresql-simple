@@ -5,6 +5,20 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+{- |
+
+There are two main ways to fetch data from PostgreSQL in a streaming
+fashion:
+
+1. Directly, using 'ResourceT' to manage resources.
+
+2. Using the various bracketed @with*@ functions; these play nicely
+   with @ContT@ from "Control.Monad.Trans.Cont" or - if you will be
+   running it all directly in IO with no other transformers on the
+   stack - the <http://hackage.haskell.org/package/managed managed>
+   package.
+
+-}
 module Database.PostgreSQL.Simple.Streaming
   ( -- * Obtaining a connection
     withPGConnection
