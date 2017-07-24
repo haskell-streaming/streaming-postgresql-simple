@@ -1,5 +1,9 @@
 # Revision history for streaming-postgresql-simple
 
+## 0.2.0.1
+
+Increase upper bound of `base`.
+
 ## 0.2.0.0  -- 2017-02-03
 
 ### Correctly perform finalisation in `query` functions.
