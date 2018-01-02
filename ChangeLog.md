@@ -1,5 +1,9 @@
 # Revision history for streaming-postgresql-simple
 
+## 0.2.0.2  -- 2018-01-02
+
+* Increase upper-bound of `streaming` to allow for 0.2
+
 ## 0.2.0.1
 
 Increase upper bound of `base`.
