@@ -1,5 +1,12 @@
 # Revision history for streaming-postgresql-simple
 
+## 0.2.0.3  -- 2018-01-02
+
+* Inline the exception handling code. In `streaming-0.1` this was provided by
+  `exceptions` instances, but in `streaming-0.2` these instances were removed.
+  Rather than rely on the instances, I've just added the implementations
+  privately.
+
 ## 0.2.0.2  -- 2018-01-02
 
 * Increase upper-bound of `streaming` to allow for 0.2
