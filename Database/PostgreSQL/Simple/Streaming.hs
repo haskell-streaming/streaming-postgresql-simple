@@ -35,9 +35,8 @@ module Database.PostgreSQL.Simple.Streaming
   ) where
 
 import Control.Exception.Safe
-       (MonadMask, catch, throwM, mask)
+       (Exception, MonadCatch, MonadMask, SomeException(..), catch, throwM, mask)
 import Control.Monad (unless)
-import Control.Monad.Catch (onException)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (runReaderT)
@@ -506,6 +505,22 @@ m1 `onTermination` io = do
             Return r -> Effect (unprotect key >> return (Return r))
             Effect m -> Effect (fmap loop m)
             Step f -> Step (fmap loop f)
+
+catchStream :: (Functor f, Exception e, MonadCatch m) => Stream f m a -> (e -> Stream f m a) -> Stream f m a
+catchStream str f = go str
+  where
+  go p = case p of
+    Step g      -> Step (fmap go g)
+    Return  r   -> Return r
+    Effect  m   -> Effect (catch (do
+        p' <- m
+        return (go p'))
+     (\e -> return (f e)) )
+
+onException :: (Functor f, MonadCatch m) => Stream f m a -> Stream f m b -> Stream f m a
+onException action handler =
+  action `catchStream` \e@SomeException{} -> handler >> lift (throwM e)
+
 
 -- | Issue a @COPY FROM STDIN@ query and stream the results in.
 --
