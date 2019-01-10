@@ -22,7 +22,7 @@ library
     exposed-modules:
         Database.PostgreSQL.Simple.Streaming
     build-depends:
-        base >=4.9 && <4.12,
+        base >=4.9 && <4.13,
         bytestring >=0.10.8.1 && <0.11,
         exceptions >=0.8.3 && <0.11,
         postgresql-libpq >=0.9.2.0 && <0.10,
