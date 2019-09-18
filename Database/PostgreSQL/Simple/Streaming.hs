@@ -323,17 +323,17 @@ doFold FoldOptions{..} parser conn q = do
                 (\_ -> ifInTransaction $ liftIO (commit conn))
                 (\_ -> go `onException` ifInTransaction (liftIO (rollback conn)))
       LibPQ.TransInTrans -> go
-      LibPQ.TransActive  -> fail "foldWithOpts FIXME:  PQ.TransActive"
+      LibPQ.TransActive  -> liftIO (fail "foldWithOpts FIXME:  PQ.TransActive")
          -- This _shouldn't_ occur in the current incarnation of
          -- the library,  as we aren't using libpq asynchronously.
          -- However,  it could occur in future incarnations of
          -- this library or if client code uses the Internal module
          -- to use raw libpq commands on postgresql-simple connections.
-      LibPQ.TransInError -> fail "foldWithOpts FIXME:  PQ.TransInError"
+      LibPQ.TransInError -> liftIO (fail "foldWithOpts FIXME:  PQ.TransInError")
          -- This should be turned into a better error message.
          -- It is probably a bad idea to automatically roll
          -- back the transaction and start another.
-      LibPQ.TransUnknown -> fail "foldWithOpts FIXME:  PQ.TransUnknown"
+      LibPQ.TransUnknown -> liftIO (fail "foldWithOpts FIXME:  PQ.TransUnknown")
          -- Not sure what this means.
   where
     ifInTransaction m = do
@@ -368,7 +368,7 @@ doFold FoldOptions{..} parser conn q = do
               stat <- liftIO (withConnection conn LibPQ.transactionStatus)
               case stat of
                 LibPQ.TransInTrans -> return ()
-                _ -> fail "Stream transaction prematurely aborted"
+                _ -> liftIO (fail "Stream transaction prematurely aborted")
 
               result <- liftIO (exec conn fetchQ)
               status <- liftIO (LibPQ.resultStatus result)
