@@ -1,5 +1,9 @@
 # Revision history for streaming-postgresql-simple
 
+## Unreleased
+
+* Support GHC 8.10
+
 ## 0.2.0.4  -- 2019-11-28
 
 * Support GHC 8.8
