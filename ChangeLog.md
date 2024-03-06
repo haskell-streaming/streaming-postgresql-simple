@@ -7,6 +7,7 @@
 * Support GHC 8.10
 * (Revision 1, 2022-11-30) Support GHC 9.0
 * (Revision 2, 2023-02-03) Support GHC 9.2
+* (Revision 3, unreleased) Support GHC 9.8 and other package updates
 
 ## 0.2.0.4  -- 2019-11-28
 
